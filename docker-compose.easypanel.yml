@@ -1,0 +1,175 @@
+# =============================================================================
+# DeskcommCRM — stack para EasyPanel (build desde tu fork, SIN WhatsApp/WAHA)
+# =============================================================================
+#
+# CÓMO SE USA EN EASYPANEL v2:
+#   1. Crea un proyecto (ej. "deskcomm").
+#   2. Agrega un servicio tipo "Compose".
+#   3. Source = Git → tu fork: https://github.com/isaqui/opensource_deskcommcrm
+#      (rama main). Compose file path = docker-compose.easypanel.yml
+#   4. En la pestaña "Environment" del servicio, pega las variables del archivo
+#      easypanel.env (te lo doy aparte). EasyPanel las inyecta y aquí se
+#      interpolan con ${...}.
+#   5. Deploy. EasyPanel construye 'app', 'worker' y 'scheduler' desde tus
+#      Dockerfiles y levanta redis + srh.
+#   6. En el servicio 'app' → pestaña "Domains" → agrega tu dominio apuntando al
+#      puerto 3000. EasyPanel emite el SSL (Let's Encrypt) por su propio Traefik.
+#      NO usamos Caddy aquí: el proxy lo pone EasyPanel.
+#
+# IMPORTANTE (nombres internos que el código espera fijos):
+#   - El servicio de la app DEBE llamarse "app": el scheduler le pega a
+#     http://app:3000 (nombre quemado en docker/scheduler/entrypoint.sh).
+#   - redis y srh conservan sus nombres: la app los alcanza por DNS de esta red.
+#
+# WHATSAPP: este stack NO incluye WAHA. Las variables WAHA_* llevan valores
+# placeholder solo para que la app arranque (lib/env.ts las exige NO vacías en
+# producción). Cuando quieras conectar WhatsApp, agregamos el servicio 'waha'.
+#
+# RAM: el build de 'app' pide ~4 GB (NODE_OPTIONS=4096 en el Dockerfile). El
+# runtime completo ronda ~1.5–2 GB. Asegúrate de tener margen en el servidor.
+# =============================================================================
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+# Bloque de entorno compartido por app, worker y scheduler. Las claves ${...}
+# vienen de la pestaña "Environment" de EasyPanel; el resto son constantes de
+# cableado interno de esta red.
+x-app-env: &app-env
+  NODE_ENV: production
+
+  # --- Supabase (los sacas del panel de supabase.com) ---
+  NEXT_PUBLIC_SUPABASE_URL: ${NEXT_PUBLIC_SUPABASE_URL}
+  NEXT_PUBLIC_SUPABASE_ANON_KEY: ${NEXT_PUBLIC_SUPABASE_ANON_KEY}
+  SUPABASE_SERVICE_ROLE_KEY: ${SUPABASE_SERVICE_ROLE_KEY}
+  SUPABASE_DB_URL: ${SUPABASE_DB_URL}
+
+  # --- URLs públicas del app (tu dominio de EasyPanel, con https://) ---
+  NEXT_PUBLIC_APP_URL: ${NEXT_PUBLIC_APP_URL}
+  NEXT_PUBLIC_ADMIN_URL: ${NEXT_PUBLIC_ADMIN_URL}
+
+  # --- Secretos generados (openssl) ---
+  INTERNAL_SECRET: ${INTERNAL_SECRET}
+  CPF_ENCRYPTION_KEY: ${CPF_ENCRYPTION_KEY}
+  WAHA_BYO_ENCRYPTION_KEY: ${WAHA_BYO_ENCRYPTION_KEY}
+  AI_CRED_AES_KEY: ${AI_CRED_AES_KEY}
+  IMPERSONATE_COOKIE_SECRET: ${IMPERSONATE_COOKIE_SECRET}
+  LGPD_SIGNING_KEY: ${LGPD_SIGNING_KEY}
+
+  # --- IA: OpenRouter (tu elección) ---
+  OPENROUTER_API_KEY: ${OPENROUTER_API_KEY}
+  # Opcional: para audio (transcripción) e indexación del RAG. Vacío = esas dos
+  # funciones quedan pausadas hasta cargar una clave OpenAI en IA › Credenciais.
+  OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+
+  # --- Redis interno (vía serverless-redis-http, protocolo Upstash) ---
+  # Constantes: apuntan al servicio 'srh' de esta misma red.
+  UPSTASH_REDIS_REST_URL: http://srh:80
+  UPSTASH_REDIS_REST_TOKEN: ${SRH_TOKEN}
+
+  # --- WAHA: placeholders (no hay contenedor WAHA en este stack) ---
+  # Solo deben existir NO vacíos para que el boot pase. WhatsApp no funcionará
+  # hasta agregar el servicio 'waha'.
+  WAHA_API_BASE_URL: http://waha:3000
+  WAHA_WEBHOOK_BASE_URL: http://app:3000
+  WAHA_API_KEY: ${WAHA_API_KEY}
+
+  # El worker es el único consumidor de los eventos de despacho del agente.
+  AGENT_DISPATCH_CONSUMER: engine
+
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    mem_limit: 768m
+    environment: *app-env
+    depends_on:
+      srh:
+        condition: service_started
+    healthcheck:
+      # Probe TCP puro (node está en la imagen). NO /api/v1/health: da 503 si una
+      # dependencia secundaria cae, y eso marcaría el contenedor "unhealthy".
+      test: ["CMD", "node", "-e", "require('net').connect(3000,'127.0.0.1').on('connect',()=>process.exit(0)).on('error',()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 40s
+    logging: *default-logging
+    networks: [internal]
+
+  # Cerebro del agente SDR (agent-engine). Sin canal conectado queda ocioso,
+  # pero listo para cuando agregues WhatsApp. Puedes comentar este servicio para
+  # un primer deploy más liviano.
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    restart: unless-stopped
+    mem_limit: 512m
+    environment:
+      <<: *app-env
+      # Dentro de esta red el WAHA (cuando exista) sería 'waha:3000'.
+      WAHA_API_BASE_URL: http://waha:3000
+    depends_on:
+      srh:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://127.0.0.1:8787/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    logging: *default-logging
+    networks: [internal]
+
+  # Cron interno (busybox crond) que golpea /api/v1/cron/* en http://app:3000.
+  # Necesario para follow-ups, campañas, retención de datos y automatizaciones.
+  scheduler:
+    build:
+      context: .
+      dockerfile: Dockerfile.scheduler
+    restart: unless-stopped
+    depends_on:
+      app:
+        condition: service_healthy
+    environment:
+      TZ: UTC
+      INTERNAL_SECRET: ${INTERNAL_SECRET}
+    logging: *default-logging
+    networks: [internal]
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--save", "", "--appendonly", "no"]  # efímero (rate-limit/idempotencia)
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+    logging: *default-logging
+    networks: [internal]
+
+  srh:
+    # serverless-redis-http: expone el protocolo REST de Upstash sobre el redis
+    # normal, sin tocar el código (el SDK @upstash/redis sigue igual).
+    image: hiett/serverless-redis-http@sha256:5b0bb9239fce53abf87b2018a7a0deb9ec7bd900c5360738fe5fbeeb426f9150
+    restart: unless-stopped
+    environment:
+      SRH_MODE: env
+      SRH_TOKEN: ${SRH_TOKEN}
+      SRH_CONNECTION_STRING: "redis://redis:6379"
+    depends_on:
+      redis:
+        condition: service_healthy
+    logging: *default-logging
+    networks: [internal]
+
+networks:
+  internal:
+    driver: bridge
