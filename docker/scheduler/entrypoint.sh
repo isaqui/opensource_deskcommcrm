@@ -18,12 +18,12 @@ if [ -z "${INTERNAL_SECRET:-}" ]; then
   exit 1
 fi
 
-# Constante, não configuração: `app` é o nome do serviço na rede interna do
-# compose, e o scheduler não fala com mais nada. A primeira versão disto lia um
-# `SCHEDULER_APP_ORIGIN` que o compose nunca repassava e nenhum template
-# documentava — controle decorativo, que é pior que controle nenhum: quem o
-# encontrasse no código o definiria no `.env` e não veria efeito.
-APP_ORIGIN="http://app:3000"
+# `app` é o nome do serviço na rede interna do compose. O default segue sendo
+# `http://app:3000`; o compose deste fork (docker-compose.easypanel.yml) passa
+# `APP_ORIGIN=http://app:3011` porque a app escuta em 3011 nesta instalação.
+# Diferente do antigo `SCHEDULER_APP_ORIGIN` decorativo: aqui o compose REPASSA
+# a variável, então ela tem efeito de verdade.
+APP_ORIGIN="${APP_ORIGIN:-http://app:3000}"
 
 # O crond executa cada linha por `/bin/sh -c`, então o segredo é REAVALIADO pelo
 # shell na hora de disparar. Interpolá-lo cru dentro de aspas duplas fazia com

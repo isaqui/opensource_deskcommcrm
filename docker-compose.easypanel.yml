@@ -13,12 +13,12 @@
 #   5. Deploy. EasyPanel construye 'app', 'worker' y 'scheduler' desde tus
 #      Dockerfiles y levanta redis + srh.
 #   6. En el servicio 'app' → pestaña "Domains" → agrega tu dominio apuntando al
-#      puerto 3000. EasyPanel emite el SSL (Let's Encrypt) por su propio Traefik.
+#      puerto 3011. EasyPanel emite el SSL (Let's Encrypt) por su propio Traefik.
 #      NO usamos Caddy aquí: el proxy lo pone EasyPanel.
 #
 # IMPORTANTE (nombres internos que el código espera fijos):
 #   - El servicio de la app DEBE llamarse "app": el scheduler le pega a
-#     http://app:3000 (nombre quemado en docker/scheduler/entrypoint.sh).
+#     http://app:3011 (via APP_ORIGIN, y la app escucha en 3011 por PORT).
 #   - redis y srh conservan sus nombres: la app los alcanza por DNS de esta red.
 #
 # WHATSAPP: este stack NO incluye WAHA. Las variables WAHA_* llevan valores
@@ -74,7 +74,7 @@ x-app-env: &app-env
   # Solo deben existir NO vacíos para que el boot pase. WhatsApp no funcionará
   # hasta agregar el servicio 'waha'.
   WAHA_API_BASE_URL: http://waha:3000
-  WAHA_WEBHOOK_BASE_URL: http://app:3000
+  WAHA_WEBHOOK_BASE_URL: http://app:3011
   WAHA_API_KEY: ${WAHA_API_KEY}
 
   # El worker es el único consumidor de los eventos de despacho del agente.
@@ -87,14 +87,17 @@ services:
       dockerfile: Dockerfile
     restart: unless-stopped
     mem_limit: 768m
-    environment: *app-env
+    environment:
+      <<: *app-env
+      # La app escucha en 3011 en esta instalación (server.js de Next respeta PORT).
+      PORT: "3011"
     depends_on:
       srh:
         condition: service_started
     healthcheck:
       # Probe TCP puro (node está en la imagen). NO /api/v1/health: da 503 si una
       # dependencia secundaria cae, y eso marcaría el contenedor "unhealthy".
-      test: ["CMD", "node", "-e", "require('net').connect(3000,'127.0.0.1').on('connect',()=>process.exit(0)).on('error',()=>process.exit(1))"]
+      test: ["CMD", "node", "-e", "require('net').connect(3011,'127.0.0.1').on('connect',()=>process.exit(0)).on('error',()=>process.exit(1))"]
       interval: 30s
       timeout: 5s
       retries: 5
@@ -127,7 +130,7 @@ services:
     logging: *default-logging
     networks: [internal]
 
-  # Cron interno (busybox crond) que golpea /api/v1/cron/* en http://app:3000.
+  # Cron interno (busybox crond) que golpea /api/v1/cron/* en http://app:3011.
   # Necesario para follow-ups, campañas, retención de datos y automatizaciones.
   scheduler:
     build:
@@ -140,6 +143,8 @@ services:
     environment:
       TZ: UTC
       INTERNAL_SECRET: ${INTERNAL_SECRET}
+      # La app escucha en 3011; el entrypoint del scheduler lee esta variable.
+      APP_ORIGIN: http://app:3011
     logging: *default-logging
     networks: [internal]
 
